@@ -1,5 +1,6 @@
 ---
 name: sfdc-data360migrate-noabstract
+author: Chandra Nayak/Snowflake
 description: "Migrate Salesforce V1 connector to V2 connector without abstracted views. Mode A: swap database names. Mode B: drop existing and recreate. Trigger: dbswap-noabstract"
 ---
 
@@ -74,6 +75,32 @@ Defaults:
 If the customer uses different names, substitute accordingly throughout.
 
 ### Step 3a: Execute Mode A — Database Name Swap with Grant Mirroring
+
+#### Phase 0: Determine Swap Method
+
+Before executing the swap, determine the **database types** for the old and new databases:
+
+> "Is the old database (`$V1_DB`) created from a **share** (imported database), and the new database (`$V2_DB`) a **catalog-linked database (CLD)**?"
+
+**If YES — old DB is from a share and new DB is a CLD:**
+
+Use the zero-copy swap function instead of manual renames. This atomically swaps the imported database with the catalog-linked database in a single operation:
+
+```sql
+SELECT SYSTEM$ZEROCOPY_SWAP_IMPORTED_DB_WITH_CLD('$V1_DB', '$V2_DB');
+```
+
+This function:
+- Swaps the two databases atomically (the CLD takes the share DB's name and vice versa)
+- Preserves grants on the original database name
+- Does not require a backup rename step
+- Is the recommended approach when migrating from a Salesforce V1 share to a V2 catalog-linked database
+
+After the swap completes, skip directly to **Step 4: Validate** — no manual grant re-application is needed since grants are preserved on the database name.
+
+**If NO — both are standard databases:**
+
+Proceed with the manual rename approach below (Phase 1 → Phase 3).
 
 #### Phase 1: Capture Grants on $V1_DB Before the Swap
 Run this **before** any renaming. Save the output — it will be used to re-apply grants after the swap.
@@ -497,6 +524,18 @@ SHOW GRANTS ON DATABASE ANALYTICS_V1;
 ```
 
 Validation runs against all swapped databases before cleanup.
+
+**Example — Mode A Zero-Copy Swap (Share → CLD)**
+
+When the old database is from a share and the new database is a catalog-linked database:
+
+```sql
+-- Single atomic swap — no rename or grant re-application needed
+SELECT SYSTEM$ZEROCOPY_SWAP_IMPORTED_DB_WITH_CLD('L0_V1', 'L0_V2');
+
+-- Validate
+SELECT COUNT(*) FROM L0_V1.SALESFORCE.ACCOUNT;
+```
 
 ## When to Apply
 - Customer is migrating from Salesforce Connector V1 to V2
