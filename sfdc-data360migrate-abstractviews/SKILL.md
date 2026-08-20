@@ -1,13 +1,14 @@
 ---
 name: sfdc-data360migrate-abstractviews
-description: "Swap the names of two Snowflake databases safely with object sync and grant mirroring. Also handles read-only databases by redirecting dependent objects from one DB to another without renaming. Use when: swapping databases, renaming databases bidirectionally, blue-green database cutover, migrating database names, database name swap, redirecting dependencies, read-only database migration, shared database replacement, migrate shared views, redirect abstracted views, sfshares migration. Triggers: swap databases, rename database, swap DB names, database cutover, blue-green swap, exchange databases, redirect dependencies, read-only database, replace shared database, migrate references, migrate sfshares, abstracted views, migrate views."
+description: "Swap the names of two Snowflake databases safely with object sync and grant mirroring. Also handles read-only databases by redirecting dependent objects from one DB to another without renaming. Also handles zerocopy swap of an imported datashare database with a catalog-linked database (CLD). Use when: swapping databases, renaming databases bidirectionally, blue-green database cutover, migrating database names, database name swap, redirecting dependencies, read-only database migration, shared database replacement, migrate shared views, redirect abstracted views, sfshares migration, zerocopy swap, datashare to CLD, imported database swap CLD. Triggers: swap databases, rename database, swap DB names, database cutover, blue-green swap, exchange databases, redirect dependencies, read-only database, replace shared database, migrate references, migrate sfshares, abstracted views, migrate views, zerocopy, datashare, catalog linked database, CLD, SYSTEM$ZEROCOPY_SWAP."
 ---
 
 # Database Swap
 
-Two workflow modes:
+Three workflow modes:
 - **Mode A (Name Swap):** Renames two databases by swapping their names with object sync and grant mirroring.
 - **Mode B (Read-Only Dependency Redirect):** For read-only/shared databases that cannot be renamed. Finds all objects across the account that depend on the first database and recreates them to reference the second database instead.
+- **Mode C (Zerocopy Swap — Datashare to CLD):** For swapping an imported datashare database with a catalog-linked database (CLD) using Snowflake's built-in system function.
 
 ## Intent Detection
 
@@ -17,9 +18,11 @@ Two workflow modes:
 |--------|------|
 | User says "swap", "rename", "exchange", databases are writable | **Mode A** |
 | User says "read-only", "shared", "imported", "redirect", "replace", databases cannot be renamed | **Mode B** |
+| User says "datashare", "catalog linked database", "CLD", "zerocopy", or one DB is an imported share and the other is a CLD | **Mode C** |
 
 If Mode A → proceed to [Workflow A](#workflow-a-name-swap)
 If Mode B → proceed to [Workflow B](#workflow-b-read-only-dependency-redirect)
+If Mode C → proceed to [Workflow C](#workflow-c-zerocopy-swap--datashare-to-cld)
 
 ---
 
@@ -29,6 +32,7 @@ If Mode B → proceed to [Workflow B](#workflow-b-read-only-dependency-redirect)
 - Both databases must exist
 - For Mode A: A single matching schema exists in both databases (e.g., PUBLIC)
 - For Mode B: A writable Level 1 database/schema containing views that reference the source database
+- For Mode C: One database is an imported datashare and the other is a catalog-linked database (CLD)
 
 ---
 
@@ -167,6 +171,112 @@ DROP DATABASE $DB1;
 
 ---
 
+## Workflow C: Zerocopy Swap — Datashare to CLD
+
+Use when one database is an imported datashare and the other is a catalog-linked database (CLD). Snowflake provides a system function that atomically swaps the imported database with the CLD, preserving grants and references.
+
+### Step C1: Gather Parameters
+
+**Ask user for:**
+
+```
+1. Imported datashare database name (IMPORTED_DB) — the database created from a data share
+2. Catalog-linked database name (CLD_DB) — the catalog-linked database to swap with
+```
+
+Store as variables: `$IMPORTED_DB`, `$CLD_DB`
+
+### Step C2: Pre-flight Checks
+
+```sql
+USE ROLE ACCOUNTADMIN;
+SHOW DATABASES LIKE '$IMPORTED_DB';
+SHOW DATABASES LIKE '$CLD_DB';
+```
+
+Verify both databases exist. Confirm:
+- `$IMPORTED_DB` is an imported share (check the `origin` column is non-empty, or `kind` indicates it's shared/imported)
+- `$CLD_DB` is a catalog-linked database (check `kind` = `LINKED_CATALOG` or similar indicator)
+
+**Schema mismatch check:**
+
+```sql
+-- Compare schemas between both databases
+SELECT schema_name FROM $IMPORTED_DB.INFORMATION_SCHEMA.SCHEMATA WHERE schema_name != 'INFORMATION_SCHEMA' ORDER BY schema_name;
+SELECT schema_name FROM $CLD_DB.INFORMATION_SCHEMA.SCHEMATA WHERE schema_name != 'INFORMATION_SCHEMA' ORDER BY schema_name;
+```
+
+If the schema names do not match between the two databases:
+
+**MANDATORY STOPPING POINT**: Present both schema lists to the user and warn that schemas differ. Ask user whether to proceed anyway or abort. Do NOT continue until user explicitly confirms.
+
+### Step C3: Review Current State
+
+```sql
+-- Check grants on both databases before swap
+SHOW GRANTS ON DATABASE $IMPORTED_DB;
+SHOW GRANTS ON DATABASE $CLD_DB;
+
+-- Check object counts
+SELECT table_schema, COUNT(*) AS object_count
+FROM $IMPORTED_DB.INFORMATION_SCHEMA.TABLES
+WHERE table_schema != 'INFORMATION_SCHEMA'
+GROUP BY table_schema;
+
+SELECT table_schema, COUNT(*) AS object_count
+FROM $CLD_DB.INFORMATION_SCHEMA.TABLES
+WHERE table_schema != 'INFORMATION_SCHEMA'
+GROUP BY table_schema;
+```
+
+**Present findings to user.**
+
+**MANDATORY STOPPING POINT**: Get user approval before executing the swap.
+
+### Step C4: Execute Zerocopy Swap
+
+```sql
+SELECT SYSTEM$ZEROCOPY_SWAP_IMPORTED_DB_WITH_CLD('$IMPORTED_DB', '$CLD_DB');
+```
+
+This system function atomically:
+- Swaps the database names
+- Preserves grants and privileges
+- Maintains references from dependent objects
+
+### Step C5: Verify
+
+```sql
+-- Verify databases exist with swapped names
+SHOW DATABASES LIKE '$IMPORTED_DB';
+SHOW DATABASES LIKE '$CLD_DB';
+
+-- Verify grants are preserved
+SHOW GRANTS ON DATABASE $IMPORTED_DB;
+SHOW GRANTS ON DATABASE $CLD_DB;
+
+-- Smoke test: query an object in the swapped database
+SELECT * FROM $IMPORTED_DB.INFORMATION_SCHEMA.TABLES WHERE table_schema != 'INFORMATION_SCHEMA' LIMIT 5;
+```
+
+**Present results to user.**
+
+### Stopping Points (Mode C)
+
+- After Step C3 (review) — user confirms the swap should proceed
+- After Step C5 (verification) — user confirms the swap completed correctly
+
+### Caveats (Mode C)
+
+| Concern | Action |
+|---------|--------|
+| Requires ACCOUNTADMIN | System function requires elevated privileges |
+| Atomic operation | The swap is all-or-nothing; no partial state |
+| Database types must match | First argument must be an imported share, second must be a CLD |
+| Dependent views/objects | References are preserved automatically by the system function |
+
+---
+
 ## Workflow A: Name Swap
 
 Use when both databases are writable and you want to swap their names.
@@ -205,6 +315,18 @@ SHOW DATABASES LIKE '${DB1}_TEMP_SWAP';
 
 **If either DB does not exist:** Stop and inform user.
 **If TEMP_SWAP name exists:** Ask user for an alternate temp name.
+
+**Schema mismatch check:**
+
+```sql
+-- Compare schemas between both databases
+SELECT schema_name FROM $DB1.INFORMATION_SCHEMA.SCHEMATA WHERE schema_name != 'INFORMATION_SCHEMA' ORDER BY schema_name;
+SELECT schema_name FROM $DB2.INFORMATION_SCHEMA.SCHEMATA WHERE schema_name != 'INFORMATION_SCHEMA' ORDER BY schema_name;
+```
+
+If the schema names do not match between the two databases:
+
+**MANDATORY STOPPING POINT**: Present both schema lists to the user and warn that schemas differ. Ask user whether to proceed anyway or abort. Do NOT continue until user explicitly confirms.
 
 ### Step 3: Audit Missing Objects
 
@@ -488,3 +610,8 @@ Grants that followed the physical objects revert automatically. Manually revoke 
 - All dependent objects across the account recreated to reference $DB2
 - Grants preserved on recreated objects
 - Verification that no remaining dependencies on $DB1 exist
+
+**Mode C:**
+- Imported datashare database and CLD swapped atomically via SYSTEM$ZEROCOPY_SWAP_IMPORTED_DB_WITH_CLD
+- Grants and references preserved automatically
+- Verification that swapped databases are accessible
